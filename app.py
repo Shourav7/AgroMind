@@ -1,15 +1,14 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from tensorflow.keras.models import load_model
-from PIL import Image
-import numpy as np
-import requests
 import os
 import io
+from PIL import Image
+import numpy as np
 import pickle
+import requests
 from dotenv import load_dotenv
 
-# Load environment variables from .env
+# Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
@@ -20,17 +19,18 @@ OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 if not OPENWEATHER_API_KEY:
     raise ValueError("Missing OPENWEATHER_API_KEY environment variable")
 
-# ---------------- Lazy-loaded models ----------------
-MODEL_PATH = "model.h5"
-model = None  # Lazy-load TF model
-
+# ---------------- Models ----------------
+MODEL_PATH = "model.h5"  # Keras model
 CROP_MODEL_PATH = "DecisionTree.pkl"
+SCALER_PATH = "scaler.pkl"
+
+# Load small models immediately (pickle is lightweight)
 if not os.path.exists(CROP_MODEL_PATH):
-    raise FileNotFoundError(f"Crop model file not found at {CROP_MODEL_PATH}")
+    raise FileNotFoundError(f"Crop model file not found: {CROP_MODEL_PATH}")
+
 with open(CROP_MODEL_PATH, "rb") as f:
     crop_model = pickle.load(f)
 
-SCALER_PATH = "scaler.pkl"
 scaler = None
 if os.path.exists(SCALER_PATH):
     with open(SCALER_PATH, "rb") as f:
@@ -44,6 +44,9 @@ CROP_CLASSES = [
     "mango","mothbeans","mungbean","muskmelon","orange","papaya",
     "pigeonpeas","pomegranate","rice","watermelon"
 ]
+
+# Lazy-load TensorFlow model to save memory
+tf_model = None
 
 CLASSES = [
     "Apple___Apple_scab","Apple___Black_rot","Apple___Cedar_apple_rust","Apple___healthy",
@@ -72,46 +75,54 @@ def home():
 @app.route("/api/weather_full", methods=["GET"])
 def weather_full():
     location = request.args.get("location", "Dhaka")
-    # Current weather
-    current_resp = requests.get(f"https://api.openweathermap.org/data/2.5/weather?q={location}&appid={OPENWEATHER_API_KEY}&units=metric")
-    if current_resp.status_code != 200:
-        return jsonify({"error": "Failed to fetch current weather"}), 500
-    current_data = current_resp.json()
 
-    # Forecast
-    forecast_resp = requests.get(f"https://api.openweathermap.org/data/2.5/forecast?q={location}&appid={OPENWEATHER_API_KEY}&units=metric")
-    if forecast_resp.status_code != 200:
-        return jsonify({"error": "Failed to fetch forecast"}), 500
-    forecast_data = forecast_resp.json()
+    try:
+        current_resp = requests.get(
+            f"https://api.openweathermap.org/data/2.5/weather?q={location}&appid={OPENWEATHER_API_KEY}&units=metric"
+        )
+        current_resp.raise_for_status()
+        current_data = current_resp.json()
 
-    hourly = forecast_data.get("list", [])[:12]
-    daily = {}
-    for item in forecast_data.get("list", []):
-        date = item["dt_txt"].split(" ")[0]
-        if date not in daily:
-            daily[date] = item
-        if len(daily) >= 7:
-            break
-    daily = list(daily.values())
+        forecast_resp = requests.get(
+            f"https://api.openweathermap.org/data/2.5/forecast?q={location}&appid={OPENWEATHER_API_KEY}&units=metric"
+        )
+        forecast_resp.raise_for_status()
+        forecast_data = forecast_resp.json()
 
-    return jsonify({"location": location, "current": current_data, "hourly": hourly, "daily": daily})
+        hourly = forecast_data.get("list", [])[:12]
+        daily = {}
+        for item in forecast_data.get("list", []):
+            date = item["dt_txt"].split(" ")[0]
+            if date not in daily:
+                daily[date] = item
+            if len(daily) >= 7:
+                break
+        daily = list(daily.values())
+
+        return jsonify({"location": location, "current": current_data, "hourly": hourly, "daily": daily})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/detect_disease", methods=["POST"])
 def detect_disease():
-    global model
+    global tf_model
     if "image" not in request.files:
         return jsonify({"error": "No image uploaded"}), 400
-    if model is None:
-        model = load_model(MODEL_PATH)
+
+    # Lazy-load model on first request
+    if tf_model is None:
+        from tensorflow.keras.models import load_model
+        tf_model = load_model(MODEL_PATH)
 
     img_file = request.files["image"]
     img = Image.open(io.BytesIO(img_file.read())).convert("RGB")
     img = img.resize((224, 224))
     img_array = np.expand_dims(np.array(img)/255.0, axis=0)
 
-    pred = model.predict(img_array)
+    pred = tf_model.predict(img_array)
     class_idx = int(np.argmax(pred))
-    disease_name = CLASSES[class_idx] if class_idx < len(CLASSES) else f"Class index {class_idx}"
+    disease_name = CLASSES[class_idx] if class_idx < len(CLASSES) else str(class_idx)
     recommendation = TREATMENTS.get(disease_name, "Follow good farming practices.")
 
     return jsonify({"disease": disease_name, "recommendation": recommendation})
@@ -138,7 +149,7 @@ def recommend_crop():
 
     return jsonify({"recommended_crop": recommended_crop_name})
 
-# ---------------- Entry Point ----------------
+# ---------------- Run App ----------------
 if __name__ == "__main__":
-    # Render requires host 0.0.0.0 and port 8080
+    # Render expects 0.0.0.0 and port 8080
     app.run(host="0.0.0.0", port=8080)
